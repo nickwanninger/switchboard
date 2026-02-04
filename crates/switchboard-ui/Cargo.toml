@@ -1,0 +1,10 @@
+[package]
+name = "switchboard-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe = "0.33.3"
+switchboard-core = { path = "../switchboard-core" }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = "0.4"
