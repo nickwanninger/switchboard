@@ -38,6 +38,15 @@ pub struct Command {
     pub source_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub commands: Vec<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExecutionStatus {
     Pending,
@@ -49,7 +58,8 @@ pub enum ExecutionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionUpdate {
     Started(Uuid),
-    Output(String),
+    Stdout(String),
+    Stderr(String),
     Exit(i32),
 }
 
@@ -61,6 +71,7 @@ pub struct ExecutionResult {
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
     pub stdout: String,
     pub stderr: String,
     pub status: ExecutionStatus,
