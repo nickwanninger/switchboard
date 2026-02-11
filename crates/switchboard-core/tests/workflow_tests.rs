@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use switchboard_core::CommandStore;
 use switchboard_core::models::{Command, Workflow};
 use uuid::Uuid;
@@ -14,6 +13,7 @@ fn test_workflow_crud() {
         name: "Test Workflow".to_string(),
         description: Some("Description".into()),
         commands: vec![],
+        env_vars: vec![],
         created_at: chrono::Utc::now(),
     };
 
@@ -45,11 +45,12 @@ fn test_workflow_integrity() {
         description: None,
         script: "echo hi".to_string(),
         working_directory: None,
-        environment: HashMap::new(),
+        env_vars: vec![],
         host: None,
         user: None,
         target_hosts: vec![],
         created_at: chrono::Utc::now(),
+        background: false,
         source_path: None,
     };
     store.add_command(cmd);
@@ -61,6 +62,7 @@ fn test_workflow_integrity() {
         name: "Integrity Flow".to_string(),
         description: None,
         commands: vec![cmd_id],
+        env_vars: vec![],
         created_at: chrono::Utc::now(),
     };
     store.add_workflow(wf);

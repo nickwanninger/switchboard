@@ -1,8 +1,26 @@
-use crate::models::{Command, Host, Workflow};
+use crate::models::{Command, ExecutionResult, Host, Workflow};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct StoreData {
+    commands: Vec<Command>,
+    workflows: Vec<Workflow>,
+    hosts: Vec<Host>,
+    #[serde(skip, default)]
+    executions: Vec<ExecutionResult>,
+}
+
+#[derive(Clone)]
 pub struct CommandStore {
-    db: sled::Db,
+    path: PathBuf,
+    data: Arc<RwLock<StoreData>>,
 }
 
 impl CommandStore {
@@ -10,9 +28,6 @@ impl CommandStore {
         use directories::ProjectDirs;
 
         // Get platform-specific data directory
-        // macOS: ~/Library/Application Support/com.switchboard.app
-        // Linux: ~/.local/share/switchboard
-        // Windows: %APPDATA%\switchboard
         let db_path = if let Some(proj_dirs) = ProjectDirs::from("io", "nickw", "switchboard") {
             let data_dir = proj_dirs.data_dir();
 
@@ -20,168 +35,265 @@ impl CommandStore {
             if let Err(e) = std::fs::create_dir_all(data_dir) {
                 eprintln!("Warning: Failed to create data directory: {}", e);
                 eprintln!("Falling back to current directory");
-                std::path::PathBuf::from("switchboard.db")
+                std::path::PathBuf::from("store.json")
             } else {
-                data_dir.join("switchboard.db")
+                data_dir.join("store.json")
             }
         } else {
             eprintln!("Warning: Could not determine data directory");
             eprintln!("Falling back to current directory");
-            std::path::PathBuf::from("switchboard.db")
+            std::path::PathBuf::from("store.json")
         };
 
         println!("Using database at: {}", db_path.display());
 
-        let db = sled::open(&db_path).expect("Failed to open database");
-        Self { db }
+        let store = Self {
+            path: db_path,
+            data: Arc::new(RwLock::new(StoreData::default())),
+        };
+
+        store.load();
+        store
     }
 
     pub fn new_test() -> Self {
-        let db = sled::Config::new().temporary(true).open().unwrap();
-        Self { db }
+        // Use a temporary file
+        let mut path = std::env::temp_dir();
+        path.push(format!("switchboard_test_{}.json", Uuid::new_v4()));
+
+        Self {
+            path,
+            data: Arc::new(RwLock::new(StoreData::default())),
+        }
     }
+
+    fn load(&self) {
+        if self.path.exists() {
+            match std::fs::read_to_string(&self.path) {
+                Ok(content) => {
+                    match serde_json::from_str::<StoreData>(&content) {
+                        Ok(data) => {
+                            *self.data.write().unwrap() = data;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to parse store.json: {}", e);
+                            // Backup corrupted file?
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to read store.json: {}", e);
+                }
+            }
+        }
+    }
+
+    fn save(&self) {
+        println!("Saving store to: {}", self.path.display());
+        let data = self.data.read().unwrap();
+        match serde_json::to_string_pretty(&*data) {
+            Ok(json) => {
+                let mut temp_path = self.path.clone();
+                temp_path.set_extension("json.tmp");
+
+                let result = (|| -> std::io::Result<()> {
+                    // 1. Write to temporary file
+                    std::fs::write(&temp_path, json)?;
+
+                    // 2. Open for syncing
+                    let file = std::fs::File::open(&temp_path)?;
+                    file.sync_all()?;
+
+                    // 3. Atomic rename
+                    std::fs::rename(&temp_path, &self.path)?;
+
+                    // 4. Sync parent directory to ensure entry is persisted
+                    if let Some(parent) = self.path.parent() {
+                        if let Ok(dir) = std::fs::File::open(parent) {
+                            let _ = dir.sync_all();
+                        }
+                    }
+                    Ok(())
+                })();
+
+                if let Err(e) = result {
+                    eprintln!("Critical Error: Failed to save store reliably: {}", e);
+                    // attempt cleanup of temp file if it exists
+                    let _ = std::fs::remove_file(temp_path);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to serialize store data: {}", e);
+            }
+        }
+    }
+
+    // --- Command Methods ---
 
     pub fn add_command(&self, cmd: Command) -> Uuid {
         let id = cmd.id;
-        let key = format!("cmd:{}", id);
-        let value = bincode::serialize(&cmd).expect("Failed to serialize command");
-        self.db
-            .insert(key.as_bytes(), value)
-            .expect("Failed to insert command");
+        {
+            let mut data = self.data.write().unwrap();
+            // Upsert: Remove existing if present
+            data.commands.retain(|c| c.id != id);
+            data.commands.push(cmd);
+        }
+        self.save();
         id
     }
 
     pub fn get_command(&self, id: &Uuid) -> Option<Command> {
-        let key = format!("cmd:{}", id);
-        self.db
-            .get(key.as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        let data = self.data.read().unwrap();
+        data.commands.iter().find(|c| c.id == *id).cloned()
     }
 
     pub fn list_commands(&self) -> Vec<Command> {
-        let prefix = b"cmd:";
-        self.db
-            .scan_prefix(prefix)
-            .filter_map(|result| result.ok())
-            .filter_map(|(_, value)| bincode::deserialize(&value).ok())
-            .collect()
+        let data = self.data.read().unwrap();
+        data.commands.clone()
     }
 
     pub fn remove_command(&self, id: &Uuid) {
-        let key = format!("cmd:{}", id);
-        let _ = self.db.remove(key.as_bytes());
+        {
+            let mut data = self.data.write().unwrap();
+            data.commands.retain(|c| c.id != *id);
+        }
+        self.save();
     }
+
+    // --- Host Methods ---
 
     pub fn add_host(&self, host: Host) -> Uuid {
         let id = host.id;
-        let key = format!("host:{}", id);
-        let value = bincode::serialize(&host).expect("Failed to serialize host");
-        self.db
-            .insert(key.as_bytes(), value)
-            .expect("Failed to insert host");
+        {
+            let mut data = self.data.write().unwrap();
+            data.hosts.retain(|h| h.id != id);
+            data.hosts.push(host);
+        }
+        self.save();
         id
     }
 
     pub fn get_host(&self, id: &Uuid) -> Option<Host> {
-        let key = format!("host:{}", id);
-        self.db
-            .get(key.as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        let data = self.data.read().unwrap();
+        data.hosts.iter().find(|h| h.id == *id).cloned()
     }
 
     pub fn list_hosts(&self) -> Vec<Host> {
-        let prefix = b"host:";
-        self.db
-            .scan_prefix(prefix)
-            .filter_map(|result| result.ok())
-            .filter_map(|(_, value)| bincode::deserialize(&value).ok())
-            .collect()
+        let data = self.data.read().unwrap();
+        data.hosts.clone()
     }
+
+    // --- Workflow Methods ---
 
     pub fn add_workflow(&self, workflow: Workflow) -> Uuid {
         let id = workflow.id;
-        let key = format!("workflow:{}", id);
-        let value = bincode::serialize(&workflow).expect("Failed to serialize workflow");
-        self.db
-            .insert(key.as_bytes(), value)
-            .expect("Failed to insert workflow");
+        {
+            let mut data = self.data.write().unwrap();
+            data.workflows.retain(|w| w.id != id);
+            data.workflows.push(workflow);
+        }
+        self.save();
         id
     }
 
     pub fn get_workflow(&self, id: &Uuid) -> Option<Workflow> {
-        let key = format!("workflow:{}", id);
-        self.db
-            .get(key.as_bytes())
-            .ok()
-            .flatten()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        let data = self.data.read().unwrap();
+        data.workflows.iter().find(|w| w.id == *id).cloned()
     }
 
     pub fn list_workflows(&self) -> Vec<Workflow> {
-        let prefix = b"workflow:";
-        self.db
-            .scan_prefix(prefix)
-            .filter_map(|result| result.ok())
-            .filter_map(|(_, value)| bincode::deserialize(&value).ok())
-            .collect()
+        let data = self.data.read().unwrap();
+        data.workflows.clone()
     }
 
     pub fn remove_workflow(&self, id: &Uuid) {
-        let key = format!("workflow:{}", id);
-        let _ = self.db.remove(key.as_bytes());
+        {
+            let mut data = self.data.write().unwrap();
+            data.workflows.retain(|w| w.id != *id);
+        }
+        self.save();
     }
 
     pub fn is_command_in_workflow(&self, cmd_id: &Uuid) -> bool {
-        self.list_workflows()
+        let data = self.data.read().unwrap();
+        data.workflows.iter().any(|w| w.commands.contains(cmd_id))
+    }
+
+    // --- Execution Methods ---
+
+    pub fn add_execution(&self, result: &ExecutionResult) {
+        {
+            let mut data = self.data.write().unwrap();
+            data.executions.retain(|e| e.id != result.id);
+            data.executions.push(result.clone());
+        }
+        self.save();
+    }
+
+    pub fn get_execution_history(&self, cmd_id: &Uuid) -> Vec<ExecutionResult> {
+        let data = self.data.read().unwrap();
+        data.executions
             .iter()
-            .any(|w| w.commands.contains(cmd_id))
-    }
-
-    pub fn add_execution(&self, result: &crate::models::ExecutionResult) {
-        // 1. Store Metadata (Lite)
-        let meta_key = format!("exec_meta:{}:{}", result.command_id, result.id);
-
-        let mut meta = result.clone();
-        // Clear heavy fields from metadata
-        meta.stdout = String::new();
-        meta.stderr = String::new();
-
-        let meta_value = bincode::serialize(&meta).expect("Failed to serialize execution metadata");
-        self.db
-            .insert(meta_key.as_bytes(), meta_value)
-            .expect("Failed to insert execution metadata");
-
-        // 2. Store Logs (Compressed)
-        let log_key = format!("exec_log:{}", result.id);
-        let output = format!("STDOUT:\n{}\n\nSTDERR:\n{}", result.stdout, result.stderr);
-
-        // Zstd compress
-        let compressed =
-            zstd::stream::encode_all(output.as_bytes(), 0).expect("Failed to compress logs");
-        self.db
-            .insert(log_key.as_bytes(), compressed)
-            .expect("Failed to insert logs");
-    }
-
-    pub fn get_execution_history(&self, cmd_id: &Uuid) -> Vec<crate::models::ExecutionResult> {
-        let prefix = format!("exec_meta:{}:", cmd_id);
-        self.db
-            .scan_prefix(prefix.as_bytes())
-            .filter_map(|result| result.ok())
-            .filter_map(|(_, value)| bincode::deserialize(&value).ok())
+            .filter(|e| e.command_id == *cmd_id)
+            .cloned()
             .collect()
     }
 
+    // New: get log is now just getting stdout/stderr from result
+    // But to keep API compatible (and maybe we want to lazy load in future?), we keep duplication?
+    // In JSON, everything is loaded.
     pub fn get_execution_log(&self, exec_id: &Uuid) -> Option<String> {
-        let key = format!("exec_log:{}", exec_id);
-        self.db.get(key.as_bytes()).ok().flatten().map(|bytes| {
-            let decoded = zstd::stream::decode_all(&bytes[..])
-                .unwrap_or_else(|_| b"<failed to decompress>".to_vec());
-            String::from_utf8_lossy(&decoded).to_string()
-        })
+        let data = self.data.read().unwrap();
+        data.executions
+            .iter()
+            .find(|e| e.id == *exec_id)
+            .map(|e| format!("STDOUT:\n{}\n\nSTDERR:\n{}", e.stdout, e.stderr))
+    }
+
+    // --- Export/Import ---
+
+    pub fn export_json(&self) -> anyhow::Result<String> {
+        let data = self.data.read().unwrap();
+        let json = serde_json::to_string_pretty(&*data)?;
+        Ok(json)
+    }
+
+    pub fn import_json(&self, json: &str) -> anyhow::Result<()> {
+        let new_data: StoreData = serde_json::from_str(json)?;
+        {
+            let mut data = self.data.write().unwrap();
+            *data = new_data;
+        }
+        self.save();
+        Ok(())
+    }
+
+    pub fn snapshot_state(&self) -> anyhow::Result<String> {
+        let data = self.data.read().unwrap();
+        let json = serde_json::to_string_pretty(&*data)?;
+
+        // 1. Compute SHA-256 hash
+        let mut hasher = Sha256::new();
+        hasher.update(json.as_bytes());
+        let hash_result = hasher.finalize();
+        let hash_hex = hex::encode(hash_result);
+
+        // 2. Determine snapshot directory and path
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("No parent directory for store path"))?;
+        let snapshots_dir = parent.join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir)?;
+
+        let snapshot_path = snapshots_dir.join(format!("{}.json.gz", hash_hex));
+
+        // 3. Gzip the content
+        let file = std::fs::File::create(&snapshot_path)?;
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(json.as_bytes())?;
+        encoder.finish()?;
+
+        Ok(hash_hex)
     }
 }
