@@ -1,9 +1,10 @@
 use crate::models::{Command, ExecutionResult, Host, Workflow};
 use flate2::Compression;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
@@ -13,7 +14,7 @@ struct StoreData {
     commands: Vec<Command>,
     workflows: Vec<Workflow>,
     hosts: Vec<Host>,
-    #[serde(skip, default)]
+    #[serde(default)]
     executions: Vec<ExecutionResult>,
 }
 
@@ -219,9 +220,30 @@ impl CommandStore {
         data.workflows.iter().any(|w| w.commands.contains(cmd_id))
     }
 
+    fn executions_dir(&self) -> PathBuf {
+        self.path.parent().expect("store path has no parent").join("executions")
+    }
+
     // --- Execution Methods ---
 
-    pub fn add_execution(&self, result: &ExecutionResult) {
+    pub fn add_execution(&self, result: &ExecutionResult, output: &str) {
+        let exec_dir = self.executions_dir();
+        if let Err(e) = std::fs::create_dir_all(&exec_dir) {
+            eprintln!("Warning: Failed to create executions directory: {}", e);
+        } else {
+            let gz_path = exec_dir.join(&result.log_file);
+            let write_result = (|| -> std::io::Result<()> {
+                let file = std::fs::File::create(&gz_path)?;
+                let mut encoder = GzEncoder::new(file, Compression::default());
+                encoder.write_all(output.as_bytes())?;
+                encoder.finish()?;
+                Ok(())
+            })();
+            if let Err(e) = write_result {
+                eprintln!("Warning: Failed to write execution log {}: {}", gz_path.display(), e);
+            }
+        }
+
         {
             let mut data = self.data.write().unwrap();
             data.executions.retain(|e| e.id != result.id);
@@ -239,15 +261,28 @@ impl CommandStore {
             .collect()
     }
 
-    // New: get log is now just getting stdout/stderr from result
-    // But to keep API compatible (and maybe we want to lazy load in future?), we keep duplication?
-    // In JSON, everything is loaded.
     pub fn get_execution_log(&self, exec_id: &Uuid) -> Option<String> {
-        let data = self.data.read().unwrap();
-        data.executions
-            .iter()
-            .find(|e| e.id == *exec_id)
-            .map(|e| format!("STDOUT:\n{}\n\nSTDERR:\n{}", e.stdout, e.stderr))
+        let log_file = {
+            let data = self.data.read().unwrap();
+            data.executions.iter().find(|e| e.id == *exec_id)?.log_file.clone()
+        };
+
+        let gz_path = self.executions_dir().join(&log_file);
+        let read_result = (|| -> std::io::Result<String> {
+            let file = std::fs::File::open(&gz_path)?;
+            let mut decoder = GzDecoder::new(file);
+            let mut content = String::new();
+            decoder.read_to_string(&mut content)?;
+            Ok(content)
+        })();
+
+        match read_result {
+            Ok(content) => Some(content),
+            Err(e) => {
+                eprintln!("Warning: Failed to read execution log {}: {}", gz_path.display(), e);
+                None
+            }
+        }
     }
 
     // --- Export/Import ---

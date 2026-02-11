@@ -16,6 +16,7 @@ pub trait CommandExecutor: Send + Sync {
     /// The callback may be called from a different thread.
     fn execute(
         &self,
+        exec_id: uuid::Uuid,
         command: &Command,
         host: &Host,
         env_vars: std::collections::HashMap<String, String>,
@@ -29,6 +30,7 @@ pub struct Executor;
 impl CommandExecutor for Executor {
     fn execute(
         &self,
+        exec_id: uuid::Uuid,
         command: &Command,
         host: &Host,
         env_vars: std::collections::HashMap<String, String>,
@@ -59,7 +61,7 @@ impl CommandExecutor for Executor {
             };
 
             if let Err(e) =
-                orchestrate_execution(env.as_ref(), &command, &host, env_vars, &*on_update, kill_rx)
+                orchestrate_execution(exec_id, env.as_ref(), &command, &host, env_vars, &*on_update, kill_rx)
             {
                 on_update(ExecutionUpdate::Stderr(format!("Execution error: {}", e)));
                 on_update(ExecutionUpdate::Exit(-1));

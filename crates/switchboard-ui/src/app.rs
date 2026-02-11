@@ -26,6 +26,7 @@ pub struct ExecutionState {
     pub is_local: bool,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub output_loaded: bool,
+    pub is_from_history: bool,
 }
 
 struct PendingExecution {
@@ -160,6 +161,29 @@ impl SwitchboardApp {
 
         let store = CommandStore::new();
 
+        // Pre-load all execution history from the store
+        let all_commands = store.list_commands();
+        let mut executions: Vec<ExecutionState> = all_commands
+            .iter()
+            .flat_map(|cmd| {
+                store.get_execution_history(&cmd.id).into_iter().map(|item| ExecutionState {
+                    id: item.id,
+                    _command_id: item.command_id,
+                    command_name: cmd.name.clone(),
+                    output_buffer: String::from("(Click to load logs)"),
+                    is_running: false,
+                    exit_code: item.exit_code,
+                    kill_tx: None,
+                    working_directory: None,
+                    is_local: false,
+                    started_at: item.started_at,
+                    output_loaded: false,
+                    is_from_history: true,
+                })
+            })
+            .collect();
+        executions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+
         // Execution channel
         let (exec_tx, exec_rx) = channel();
 
@@ -176,7 +200,7 @@ impl SwitchboardApp {
             edited_workflow: None,
             pending_execution: None,
             active_workflow: None,
-            executions: Vec::new(),
+            executions,
             execution_tx: exec_tx,
             execution_rx: exec_rx,
         }
@@ -436,6 +460,7 @@ impl SwitchboardApp {
                 is_local: cmd.host.is_none(),
                 started_at: chrono::Utc::now(),
                 output_loaded: true,
+                is_from_history: false,
             };
             self.executions.push(state);
             
@@ -464,7 +489,7 @@ impl SwitchboardApp {
             }
             
             // Run
-            if let Err(e) = self.executor.execute(&cmd, &dummy_host, execution_env_vars, cb, kill_rx) {
+            if let Err(e) = self.executor.execute(exec_id, &cmd, &dummy_host, execution_env_vars, cb, kill_rx) {
                  eprintln!("Failed to start execution: {}", e);
             }
         }
@@ -753,12 +778,11 @@ impl App for SwitchboardApp {
                             finished_at: Some(finished_at),
                             exit_code: Some(code),
                             duration_ms: Some(duration),
-                            stdout: state.output_buffer.clone(), // We assume stdout/stderr are mixed in buffer for now
-                            stderr: state.output_buffer.clone(),
                             status: if code == 0 { switchboard_core::models::ExecutionStatus::Completed } else { switchboard_core::models::ExecutionStatus::Failed },
+                            log_file: format!("{}.log.gz", state.id),
                         };
-                        
-                        self.store.add_execution(&result);
+
+                        self.store.add_execution(&result, &state.output_buffer);
                         
                         // Check workflow progress
                         self.check_workflow_progress(exec_id, code);
@@ -851,42 +875,58 @@ impl App for SwitchboardApp {
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
                     ui.heading("Run History");
-                    
-                    if let Some(Selection::Command(_cmd_id)) = self.active_selection {
-                        // Reload history logic (debounce usage appropriately in real app, strictly needed here?)
-                        // For this implementation, we will append history items that aren't already in `executions`
-                        // A simple way is to load them when selecting the command (done in the `update` loop below for simplicity of tool application)
-                    }
-
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("sidebar_executions_scroll")
                         .show(ui, |ui| {
-                             // Show in reverse order (newest first)
-                             let mut execution_to_nav = None;
-                             for exec in self.executions.iter().rev() {
-                                 let is_selected = matches!(self.active_selection, Some(Selection::Execution(id)) if id == exec.id);
-                                 
-                                 ui.horizontal(|ui| {
-                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                     if exec.is_running {
-                                         ui.add(egui::Spinner::new().size(12.0));
-                                     } else if exec.exit_code == Some(0) {
-                                         ui.label("✅");
-                                     } else {
-                                         ui.label("❌");
-                                     }
-                                     
-                                     let label = format!("{} ({})", exec.command_name, exec.id.to_string().chars().take(4).collect::<String>());
-                                     if ui.selectable_label(is_selected, label).clicked() {
-                                         execution_to_nav = Some(exec.id);
-                                     }
-                                 });
-                             }
-                             
-                             if let Some(id) = execution_to_nav {
-                                 self.navigate_to(Selection::Execution(id));
-                             }
+                            let mut execution_to_nav = None;
+
+                            let session_execs: Vec<_> = self.executions.iter()
+                                .filter(|e| !e.is_from_history)
+                                .collect();
+                            let history_execs: Vec<_> = self.executions.iter()
+                                .filter(|e| e.is_from_history)
+                                .collect();
+
+                            let render_exec = |ui: &mut egui::Ui, exec: &&ExecutionState, nav: &mut Option<Uuid>| {
+                                let is_selected = matches!(self.active_selection, Some(Selection::Execution(id)) if id == exec.id);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    if exec.is_running {
+                                        ui.add(egui::Spinner::new().size(12.0));
+                                    } else if exec.exit_code == Some(0) {
+                                        ui.label("✅");
+                                    } else {
+                                        ui.label("❌");
+                                    }
+                                    let time = exec.started_at.with_timezone(&chrono::Local).format("%m/%d %H:%M");
+                                    let label = format!("{} ({})", exec.command_name, time);
+                                    if ui.selectable_label(is_selected, label).clicked() {
+                                        *nav = Some(exec.id);
+                                    }
+                                });
+                            };
+
+                            if !session_execs.is_empty() {
+                                ui.label(egui::RichText::new("This Session").small().weak());
+                                for exec in session_execs.iter().rev() {
+                                    render_exec(ui, exec, &mut execution_to_nav);
+                                }
+                            }
+
+                            if !history_execs.is_empty() {
+                                if !session_execs.is_empty() {
+                                    ui.add_space(6.0);
+                                }
+                                ui.label(egui::RichText::new("History").small().weak());
+                                for exec in history_execs.iter().rev() {
+                                    render_exec(ui, exec, &mut execution_to_nav);
+                                }
+                            }
+
+                            if let Some(id) = execution_to_nav {
+                                self.navigate_to(Selection::Execution(id));
+                            }
                         });
                 });
             });
@@ -1066,29 +1106,7 @@ impl App for SwitchboardApp {
                              });
                     }
                 },
-                Some(Selection::Command(cmd_id)) => {
-                    // Update executions list with history if not present (simple naive check)
-                    // In a real app we'd want to cache this efficiently
-                    let history = self.store.get_execution_history(&cmd_id);
-                    for item in history {
-                        if !self.executions.iter().any(|e| e.id == item.id) {
-                            self.executions.push(ExecutionState {
-                                id: item.id,
-                                _command_id: item.command_id,
-                                command_name: "".to_string(), // Name might be missing in lite metadata, need lookup? or just use empty
-                                output_buffer: String::from("(Click to load logs)"),
-                                is_running: false,
-                                exit_code: item.exit_code,
-                                kill_tx: None,
-                                working_directory: None, // Not persisted in meta currently?
-                                is_local: false, // Not persisted?
-                                started_at: item.started_at,
-                                output_loaded: false,
-                            });
-                        }
-                    }
-                    // Sort executions by date
-                    self.executions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+                Some(Selection::Command(_cmd_id)) => {
 
                     // COMMAND EDITOR VIEW
                     if let Some(edit_state) = &mut self.edited_command {
@@ -1224,7 +1242,12 @@ impl App for SwitchboardApp {
                          ui.horizontal(|ui| {
                             ui.heading(format!("Run: {}", state.command_name));
                             ui.add_space(10.0);
-                            
+
+                            if ui.small_button("📋 Copy ID").on_hover_text(exec_id.to_string()).clicked() {
+                                ui.output_mut(|o| o.commands.push(egui::OutputCommand::CopyText(exec_id.to_string())));
+                            }
+                            ui.add_space(6.0);
+
                             if state.is_running {
                                 ui.spinner();
                                 ui.label("Running");

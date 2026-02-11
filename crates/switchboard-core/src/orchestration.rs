@@ -3,6 +3,7 @@ use crate::run_environment::{OutputChunk, RunEnvironment, RunEnvironmentError};
 use std::collections::HashMap;
 
 pub(crate) fn orchestrate_execution(
+    exec_id: uuid::Uuid,
     env: &dyn RunEnvironment,
     command: &Command,
     _host: &Host,
@@ -10,11 +11,10 @@ pub(crate) fn orchestrate_execution(
     on_update: &dyn Fn(ExecutionUpdate),
     kill_rx: std::sync::mpsc::Receiver<()>,
 ) -> Result<(), RunEnvironmentError> {
-    let run_uuid = uuid::Uuid::new_v4();
-    let log_file = format!("/tmp/switchboard_{}.log", run_uuid);
-    let script_path = format!("/tmp/switchboard_{}.sh", run_uuid);
+    let log_file = format!("/tmp/switchboard_{}.log", exec_id);
+    let script_path = format!("/tmp/switchboard_{}.sh", exec_id);
 
-    env_vars.insert("SWITCHBOARD_RUN".to_string(), run_uuid.to_string());
+    env_vars.insert("SWITCHBOARD_RUN".to_string(), exec_id.to_string());
     env_vars.insert("SWITCHBOARD_LOG".to_string(), log_file.clone());
 
     env.write_file(&script_path, command.script.as_bytes())?;

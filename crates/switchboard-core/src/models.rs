@@ -151,7 +151,6 @@ pub struct ExecutionResult {
     pub finished_at: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
-    pub stdout: String,
-    pub stderr: String,
     pub status: ExecutionStatus,
+    pub log_file: String, // e.g. "550e8400-e29b-41d4-a716-446655440000.log.gz"
 }
