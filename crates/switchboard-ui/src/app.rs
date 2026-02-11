@@ -5,7 +5,7 @@ use switchboard_core::{
     save_command,
 };
 use uuid::Uuid;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Selection {
@@ -149,6 +149,17 @@ pub struct SwitchboardApp {
     // We send (ExecutionID, Update) to identify which run the update belongs to
     execution_tx: Sender<(Uuid, ExecutionUpdate)>,
     execution_rx: Receiver<(Uuid, ExecutionUpdate)>,
+}
+
+fn parse_group_prefix(name: &str) -> (Option<&str>, &str) {
+    if let Some(colon_pos) = name.find(':') {
+        let group = name[..colon_pos].trim();
+        let display = name[colon_pos + 1..].trim();
+        if !group.is_empty() && !display.is_empty() {
+            return (Some(group), display);
+        }
+    }
+    (None, name)
 }
 
 impl SwitchboardApp {
@@ -811,25 +822,67 @@ impl App for SwitchboardApp {
                     });
                     let mut workflows = self.store.list_workflows();
                     workflows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                    
+
+                    let mut ungrouped_wfs: Vec<&switchboard_core::models::Workflow> = Vec::new();
+                    let mut wf_groups: BTreeMap<String, Vec<(&switchboard_core::models::Workflow, String)>> = BTreeMap::new();
+
+                    for wf in &workflows {
+                        match parse_group_prefix(&wf.name) {
+                            (None, _) => ungrouped_wfs.push(wf),
+                            (Some(group), display) => {
+                                wf_groups.entry(group.to_string()).or_default()
+                                    .push((wf, display.to_string()));
+                            }
+                        }
+                    }
+
+                    let mut wf_to_select: Option<Uuid> = None;
+                    let mut workflow_to_run_sidebar: Option<Uuid> = None;
+
                     egui::ScrollArea::vertical()
                     .id_salt("sidebar_workflows_scroll")
                     .max_height(100.0)
                     .show(ui, |ui| {
-                        for wf in workflows {
+                        for wf in &ungrouped_wfs {
                             ui.horizontal(|ui| {
                                 if ui.small_button("▶").clicked() {
-                                    self.trigger_workflow_execution(wf.id);
+                                    workflow_to_run_sidebar = Some(wf.id);
                                 }
                                 let is_selected = matches!(self.active_selection, Some(Selection::Workflow(id)) if id == wf.id);
                                 if ui.selectable_label(is_selected, &wf.name).clicked() {
-                                    self.navigate_to(Selection::Workflow(wf.id));
-                                    self.edited_workflow = Some(WorkflowEditState::from_workflow(&wf));
-                                    self.edited_command = None;
+                                    wf_to_select = Some(wf.id);
                                 }
                             });
                         }
+                        for (group_name, members) in &wf_groups {
+                            egui::CollapsingHeader::new(group_name)
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    for (wf, display_name) in members {
+                                        ui.horizontal(|ui| {
+                                            if ui.small_button("▶").clicked() {
+                                                workflow_to_run_sidebar = Some(wf.id);
+                                            }
+                                            let is_selected = matches!(self.active_selection, Some(Selection::Workflow(id)) if id == wf.id);
+                                            if ui.selectable_label(is_selected, display_name.as_str()).clicked() {
+                                                wf_to_select = Some(wf.id);
+                                            }
+                                        });
+                                    }
+                                });
+                        }
                     });
+
+                    if let Some(id) = wf_to_select {
+                        if let Some(wf) = self.store.get_workflow(&id) {
+                            self.navigate_to(Selection::Workflow(id));
+                            self.edited_workflow = Some(WorkflowEditState::from_workflow(&wf));
+                            self.edited_command = None;
+                        }
+                    }
+                    if let Some(id) = workflow_to_run_sidebar {
+                        self.trigger_workflow_execution(id);
+                    }
                     
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -840,29 +893,69 @@ impl App for SwitchboardApp {
                              }
                         });
                     });
-                    // Clone commands to avoid borrow checker issues when calling trigger_command_execution
                     let mut commands = self.store.list_commands();
-                    // Sort by creation date (newest first)
                     commands.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+                    let mut ungrouped_cmds: Vec<&switchboard_core::models::Command> = Vec::new();
+                    let mut cmd_groups: BTreeMap<String, Vec<(&switchboard_core::models::Command, String)>> = BTreeMap::new();
+
+                    for cmd in &commands {
+                        match parse_group_prefix(&cmd.name) {
+                            (None, _) => ungrouped_cmds.push(cmd),
+                            (Some(group), display) => {
+                                cmd_groups.entry(group.to_string()).or_default()
+                                    .push((cmd, display.to_string()));
+                            }
+                        }
+                    }
+
+                    let mut command_to_select: Option<Uuid> = None;
+                    let mut command_to_run: Option<Uuid> = None;
+
                     egui::ScrollArea::vertical()
                         .id_salt("sidebar_commands_scroll")
                         .max_height(ctx.content_rect().height() * 0.5)
                         .show(ui, |ui| {
-                            for cmd in commands {
+                            for cmd in &ungrouped_cmds {
                                 ui.horizontal(|ui| {
                                     if ui.small_button("▶").clicked() {
-                                        self.trigger_command_execution(cmd.id);
+                                        command_to_run = Some(cmd.id);
                                     }
-                                    
                                     let is_selected = matches!(self.active_selection, Some(Selection::Command(id)) if id == cmd.id);
                                     if ui.selectable_label(is_selected, &cmd.name).clicked() {
-                                        self.navigate_to(Selection::Command(cmd.id));
-                                        // Initialize edit state
-                                        self.edited_command = Some(CommandEditState::from_command(&cmd));
+                                        command_to_select = Some(cmd.id);
                                     }
                                 });
                             }
+                            for (group_name, members) in &cmd_groups {
+                                egui::CollapsingHeader::new(group_name)
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for (cmd, display_name) in members {
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("▶").clicked() {
+                                                    command_to_run = Some(cmd.id);
+                                                }
+                                                let is_selected = matches!(self.active_selection, Some(Selection::Command(id)) if id == cmd.id);
+                                                if ui.selectable_label(is_selected, display_name.as_str()).clicked() {
+                                                    command_to_select = Some(cmd.id);
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
                         });
+
+                    if let Some(id) = command_to_select {
+                        if let Some(cmd) = self.store.get_command(&id) {
+                            self.navigate_to(Selection::Command(id));
+                            self.edited_command = Some(CommandEditState::from_command(&cmd));
+                            self.edited_workflow = None;
+                        }
+                    }
+                    if let Some(id) = command_to_run {
+                        self.trigger_command_execution(id);
+                    }
                 });
 
 
